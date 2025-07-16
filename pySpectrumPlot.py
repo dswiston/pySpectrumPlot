@@ -64,10 +64,11 @@ class Sdr():
         
         # Enable rx channel
         self.rxadc.channels[0].enabled = True;
+        self.rxadc.channels[1].enabled = True; # one for I, one for Q
         
         # Create IQ buffer
         self.freqSpacing = freqSpacing;
-        self.buffSize = buffSize; #
+        self.buffSize = buffSize;
         self.rxBuff = iio.Buffer(self.rxadc, self.buffSize, False);
         
         # Define the frequency vector resulting from taking the FFT of each buffer
@@ -99,6 +100,7 @@ class Plt():
         # Create an ImageView widget
         self.image = pg.ImageView(view=self.plot);
         
+        # Set the hover event callback
         self.image.hoverEvent = self.show_tooltip
 
         # Set the default image data
@@ -110,6 +112,7 @@ class Plt():
         
         # setting color map to the image view - pg.colormap.listMaps()
         self.image.setColorMap(cm)
+        
         
     def show_tooltip(self, event):
         # Check to make sure this isn't an exit event
@@ -127,20 +130,19 @@ class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
         
-        self.rfBandwidth = 50000000;
-        self.sampRate = 50000000;
-        self.freqSpacing = 600;
+        self.freqSpacing = 500;
         # Define the frequency scanning range
         self.startFreq = 87.5e6;   # FM Radio
-        self.stopFreq = 107.5e6;
+        self.stopFreq = 107.5e6;       
         # self.startFreq = 108e6;    # Radar
         # self.stopFreq = 117.975e6;
-        self.startFreq = 174e6;      # VHF Broadcast TV
-        self.stopFreq = 216e6;
+        # self.startFreq = 174e6;      # VHF Broadcast TV
+        # self.stopFreq = 216e6;
         # self.startFreq = 470e6;      # UHF Broadcast TV (trimmed)
         # self.stopFreq = 608e6;
         # self.startFreq = 902e6;    # UHF ISM
         # self.stopFreq = 928e6;
+
         # self.startFreq = 1088e6;   # ADSB
         # self.stopFreq = 1092e6;
         # self.startFreq = 1028e6;   # ADSB
@@ -152,11 +154,22 @@ class MainWindow(QtWidgets.QMainWindow):
         # self.startFreq = 1300e6;   # Radar
         # self.stopFreq = 1350e6;
         # self.startFreq = 2.4e9;    # 2.4GHz ISM
-        # self.stopFreq = 2.4835e9;
+        # self.stopFreq = 2.4835e9;        
+        
+        # Define min and max rates to allow
+        maxRate = 56000000.0;
+        minRate =  3000000.0;
+        
+        # Attempt to derive the most efficient setting while not violating limits
+        self.rfBandwidth = max(min(maxRate,(self.stopFreq-self.startFreq)*1.01),minRate);
+        self.sampRate = self.rfBandwidth;
         self.buffSize = int(self.sampRate / self.freqSpacing);
         
         # Create plot window
         self.plt = Plt(self.startFreq,self.stopFreq,self.sampRate,self.buffSize,self.freqSpacing);
+        self.setCentralWidget(self.plt.image);
+        self.fps = 0;
+        self.updateTime = time.time();
         
         # Create the data thread
         self.dataAcq = DataAcquisition(self.startFreq,self.stopFreq,self.sampRate,self.buffSize,self.rfBandwidth,self.freqSpacing);
@@ -164,9 +177,17 @@ class MainWindow(QtWidgets.QMainWindow):
         self.dataAcq.dataSignal.connect(self.UpdatePlot);
         # Start the data thread
         self.dataAcq.start();
+        
+    def closeEvent(self, event):
+        """Handle cleanup when the window is closed."""
+        print("Closing application...")
+        self.dataAcq.stop();  # Gracefully stop the thread
+        self.dataAcq.wait();  # Wait for the thread to finish
+        event.accept();
 
     
     def UpdatePlot(self,magData):
+
       # Roll (circ shift) the buffer in anticipation of inserting new data
       # This goes "bottom up" - if you want top down change the roll to +1 and place the new data
       # in to the first element
@@ -175,13 +196,18 @@ class MainWindow(QtWidgets.QMainWindow):
       self.plt.imgBuff[-1,] = magData;
                   
       # Update the image data
-      self.plt.image.setImage(self.plt.imgBuff.T, levels=(-90, -60), scale=(self.plt.freqSpacing/1e6,1), pos=(self.plt.startFreq/1e6,0)) #, autoLevels=False);
-         
+      self.plt.image.setImage(self.plt.imgBuff.T, levels=(-90, -40), scale=(self.plt.freqSpacing/1e6,1), pos=(self.plt.startFreq/1e6,0)) #, autoLevels=False);
+      tmpTime = time.time();
+      self.fps = self.fps * 0.5 + 1/(tmpTime-self.updateTime);
+      self.updateTime = tmpTime;
+      #print(self.fps);
+
         
 class DataAcquisition(QtCore.QThread):
   
     # Signal to send data to the main thread - object data type b/c we're sending an nparray
     dataSignal = QtCore.pyqtSignal(object); 
+    runThread = True;
         
     def __init__(self,startFreq,stopFreq,sampRate,buffSize,rfBandwidth,freqSpacing):
         super().__init__()
@@ -189,18 +215,21 @@ class DataAcquisition(QtCore.QThread):
         self.sdr = Sdr(sampRate,buffSize,rfBandwidth,freqSpacing);
         self.startFreq = startFreq;
         self.stopFreq = stopFreq;
-
+        
+    def stop(self):
+      self.runThread = False;
+      
     def run(self):
 
       numCols = int(math.ceil((self.stopFreq-self.startFreq)/self.sdr.sampRate*self.sdr.buffSize));
       fftData = np.zeros((numCols,),dtype=np.complex64);
       magData = np.zeros((numCols,),dtype=np.complex64);
 
-      while True:
-
+      while self.runThread:
+        
+        tic = time.time();
         freqTune = self.startFreq+self.sdr.sampRate/2;
         
-        # tic = time.time() 
         while freqTune <= self.stopFreq+self.sdr.sampRate/2:
 
            # Tune the LO
@@ -211,7 +240,10 @@ class DataAcquisition(QtCore.QThread):
            
            # Fill and grab a buffers worth of data
            self.sdr.rxBuff.refill();
-           data = np.frombuffer(self.sdr.rxBuff.read(),dtype=np.int16) / 2**12;
+           tmpData = np.frombuffer(self.sdr.rxBuff.read(),dtype=np.int16) / 2**12;
+           data = np.empty((int(len(tmpData)/2)), dtype=np.complex64);
+           data.real = tmpData[::2];
+           data.imag = tmpData[1::2];
            
            # Calculate the frequency spectrum
            tmp = numpy.fft.fft(data)/self.sdr.buffSize;  # Remove FFT gain by scaling by buffer size
@@ -230,18 +262,23 @@ class DataAcquisition(QtCore.QThread):
            
            # Advance the RF frequency tune
            freqTune = freqTune + self.sdr.sampRate - self.sdr.freqPad;
-           
-        # print(time.time()-tic)
        
         magData = 20*numpy.log10(numpy.abs(fftData));
         magData[np.isinf(magData)] = -100;
+        
+        # Lame attempt to throttle update rate & smooth out the display
+        elapsedTime = time.time()-tic;
+        if elapsedTime < 0.025:
+          time.sleep(0.025-elapsedTime);
+        
         self.dataSignal.emit(magData);
 
+      print("Data thread exiting")
        
        
 app = QtWidgets.QApplication([]);
 
 main = MainWindow();
-main.plt.image.show();
+main.show();
 app.exec();
 
